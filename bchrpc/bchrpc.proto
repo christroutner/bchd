@@ -77,6 +77,9 @@ service bchrpc {
     // Submit a transaction to all connected peers.
     rpc SubmitTransaction(SubmitTransactionRequest) returns (SubmitTransactionResponse) {}
 
+    // Return SLP token metadata
+    rpc GetTokenMetadata(GetTokenMetadataRequest) returns (GetTokenMetadataResponse) {}
+
     // Subscribe to relevant transactions based on the subscription requests.
     //
     // This RPC does not use bi-directional streams and therefore can be used
@@ -197,9 +200,13 @@ message GetHeadersResponse {
 
 message GetTransactionRequest {
     bytes hash = 1;
+
+    bool include_slp_metadata = 2; // this is token metadata.  txn level SLP data will be returned regardless of this value
 }
 message GetTransactionResponse {
     Transaction transaction = 1;
+
+    TokenMetadata slp_metadata = 2;
 }
 
 message GetRawTransactionRequest {
@@ -339,6 +346,13 @@ message SubscribeBlocksRequest {
     bool serialize_block = 3;
 }
 
+message GetTokenMetadataRequest {
+    repeated bytes token_ids = 1;
+}
+
+message GetTokenMetadataResponse {
+    repeated TokenMetadata slp_metadata = 1;
+}
 
 // NOTIFICATIONS
 
@@ -429,8 +443,18 @@ message Transaction {
         string address = 4;
         string script_class = 5;
         string disassembled_script = 6;
-    }
 
+        // slp
+        enum SlpOutputType {
+            NON_SLP = 0;
+            V1_GENESIS = 1;
+            V1_MINT = 2;
+            V1_SEND = 3;
+        }
+        SlpOutputType slp_type = 7;
+        bool slp_amount = 8;
+        bytes slp_token_id = 9;
+    }
     bytes hash = 1;
     int32 version = 2;
     repeated Input inputs = 3;
@@ -443,6 +467,15 @@ message Transaction {
     int32 confirmations = 10;
     int32 block_height = 11;
     bytes block_hash = 12;
+
+    // slp type of involvement for this transaction
+    enum SlpInvolvement {
+        NON_SLP = 0;
+        SLP_OUTPUTS = 1;
+        SLP_BURNED_INPUTS_FROM_INVALID_MESSAGE = 2;
+        SLP_BURNED_INPUTS_FROM_OUTPUTS_TOO_HIGH = 3;
+    }
+    repeated SlpInvolvement slp_involvement = 13;
 }
 
 message MempoolTransaction {
@@ -478,6 +511,41 @@ message TransactionFilter {
     // - scriptPubkey
 
     // Subscribed/Unsubscribe to everything. Other filters
-    // will be ignored.
-    bool all_transactions = 4;
+    // will be ignored.    
+    oneof all_txn_override {
+        bool all_transactions = 4;
+        bool all_slp_transactions = 5;
+    }
+    // only transactions associated with the included tokenIds
+    repeated string slp_token_ids = 6;
+}
+
+message TokenMetadataTokenType1 {
+	// nothing special here
+}
+
+message TokenMetadataNFT1Group {
+    //repeated bytes nftChildIDs = 1; // DO WE WANT THIS?
+}
+
+message TokenMetadataNFT1Child {
+    bytes nft1_group_id = 1;
+}
+
+message TokenMetadata {
+	bytes token_id = 1;
+ 	uint32 token_type = 2;
+	string token_ticker = 3;
+	string token_name = 4;
+	string token_document_url = 5;
+	string token_document_hash = 6;
+	uint32 decimals = 7;
+	uint64 initial_token_mint_quantity = 8;
+	bytes mint_baton_txid = 9;
+	uint32 height_created = 10;
+	oneof type_metadata {
+        TokenMetadataTokenType1 metadata_type1 = 11;
+        TokenMetadataNFT1Group metadata_nft1_group = 12;
+        TokenMetadataNFT1Child metadata_nft1_child = 13;
+    }
 }
