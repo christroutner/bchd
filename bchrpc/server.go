@@ -3,6 +3,7 @@ package bchrpc
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"math/big"
@@ -98,6 +99,8 @@ type GrpcServerConfig struct {
 	TxIndex   *indexers.TxIndex
 	AddrIndex *indexers.AddrIndex
 	CfIndex   *indexers.CfIndex
+	// SlpTxidIndex     *indexers.SlpTxidIndex
+	// SlpMetadataIndex *indexers.SlpMetadataIndex
 }
 
 // GrpcServer is the gRPC server implementation. It holds all the objects
@@ -113,6 +116,8 @@ type GrpcServer struct {
 	txIndex   *indexers.TxIndex
 	addrIndex *indexers.AddrIndex
 	cfIndex   *indexers.CfIndex
+	// SlpTxidIndex     *indexers.SlpTxidIndex
+	// SlpMetadataIndex *indexers.SlpMetadataIndex
 
 	httpServer *http.Server
 	subscribe  chan *rpcEventSubscription
@@ -1001,9 +1006,14 @@ func (s *GrpcServer) GetUnspentOutput(ctx context.Context, req *pb.GetUnspentOut
 		blockHeight  int32
 		scriptPubkey []byte
 		coinbase     bool
+		msgTx        *wire.MsgTx
+		utxoEntry    *blockchain.UtxoEntry
+		slpToken     pb.SlpToken
 	)
+
 	if req.IncludeMempool && s.txMemPool.HaveTransaction(txnHash) {
 		tx, err := s.txMemPool.FetchTransaction(txnHash)
+		msgTx = tx.MsgTx()
 		if err != nil {
 			return nil, status.Error(codes.NotFound, "utxo not found")
 		}
@@ -1018,7 +1028,16 @@ func (s *GrpcServer) GetUnspentOutput(ctx context.Context, req *pb.GetUnspentOut
 		blockHeight = mining.UnminedHeight
 		scriptPubkey = tx.MsgTx().TxOut[req.Index].PkScript
 		coinbase = blockchain.IsCoinBase(tx)
+
+		// extract slp data
+		view, err := s.txMemPool.FetchUtxoView(tx)
+		//utxoView = view
+		if err != nil {
+			return nil, status.Error(codes.Internal, "unconfiremd utxo is missing from UtxoView")
+		}
+		utxoEntry = view.LookupEntry(*op)
 	} else {
+		//utxoView, err = ctx.
 		if req.IncludeMempool {
 			spendingTx := s.txMemPool.CheckSpend(*op)
 			if spendingTx != nil {
@@ -1039,6 +1058,56 @@ func (s *GrpcServer) GetUnspentOutput(ctx context.Context, req *pb.GetUnspentOut
 		coinbase = entry.IsCoinBase()
 	}
 
+	if utxoEntry.IsSlp() {
+
+		// TODO: instead of parsing txn msg, lookup tokenID and amount from
+		//		  txid=>SLP OP_RETURN db OR SLP txid => TokenID
+
+		if msgTx == nil {
+			txBytes, _, _, _ := s.fetchTransactionFromBlock(txnHash)
+			err := msgTx.Deserialize(bytes.NewReader(txBytes))
+			if err != nil {
+				return nil, status.Error(codes.Internal, "failed to deserialize transaction")
+			}
+		}
+
+		slpMsg, err := v1parser.ParseSLP(msgTx.TxOut[0].PkScript)
+		if err != nil {
+			panic("")
+		}
+
+		var tokenID []byte
+		var amt uint64
+		isMintBaton := false
+
+		if utxoEntry.IsSlpType1MintBatonTxo() {
+			if slpMsg.TransactionType == "SEND" {
+				tokenID = slpMsg.Data.(v1parser.SlpSend).TokenID
+				amt = slpMsg.Data.(v1parser.SlpSend).Amounts[req.Index-1]
+			} else if slpMsg.TransactionType == "GENESIS" {
+				tokenID, _ = hex.DecodeString(msgTx.TxHash().String())
+				amt = slpMsg.Data.(v1parser.SlpGenesis).Qty
+			} else if slpMsg.TransactionType == "MINT" {
+				tokenID = slpMsg.Data.(v1parser.SlpMint).TokenID
+				amt = slpMsg.Data.(v1parser.SlpMint).Qty
+			}
+		} else if utxoEntry.IsSlpType1MintBatonTxo() {
+			tokenID = slpMsg.Data.(v1parser.SlpMint).TokenID
+			amt = 0
+		} else if utxoEntry.IsSlpUnknownVersionTxo() {
+
+		} else {
+			panic("UtxoEntry is missing a valid SLP annotation")
+		}
+
+		slpToken = pb.SlpToken{
+			TokenId:     tokenID,
+			Amount:      amt,
+			Address:     "", // TODO!
+			IsMintBaton: isMintBaton,
+		}
+	}
+
 	ret := &pb.GetUnspentOutputResponse{
 		Outpoint: &pb.Transaction_Input_Outpoint{
 			Hash:  txnHash[:],
@@ -1048,6 +1117,7 @@ func (s *GrpcServer) GetUnspentOutput(ctx context.Context, req *pb.GetUnspentOut
 		PubkeyScript: scriptPubkey,
 		BlockHeight:  blockHeight,
 		IsCoinbase:   coinbase,
+		SlpToken:     &slpToken,
 	}
 	return ret, nil
 }
@@ -1865,7 +1935,10 @@ func marshalTransaction(tx *bchutil.Tx, confirmations int32, blockHeader *wire.B
 	slpMsg, slpParseErr := v1parser.ParseSLP(tx.MsgTx().TxOut[0].PkScript)
 	if slpParseErr == nil {
 
-		if slpMsg.TransactionType == "GENESIS" {
+		if (slpMsg.TokenType == 0x01 ||
+			slpMsg.TokenType == 0x41 ||
+			slpMsg.TokenType == 0x81) &&
+			slpMsg.TransactionType == "GENESIS" {
 			hash := tx.Hash().CloneBytes()
 			for i := len(hash) - 1; i >= 0; i-- {
 				slpInfo.TokenId = append(slpInfo.TokenId, hash[i])

@@ -268,6 +268,9 @@ type SpentTxOut struct {
 
 	// Denotes if the creating tx is a coinbase.
 	IsCoinBase bool
+
+	// Denotes if the creating tx is SLP.
+	IsSlp bool
 }
 
 // FetchSpendJournal attempts to retrieve the spend journal, or the set of

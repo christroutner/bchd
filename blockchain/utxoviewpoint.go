@@ -5,12 +5,16 @@
 package blockchain
 
 import (
+	"errors"
 	"fmt"
+
+	"math/big"
 
 	"github.com/gcash/bchd/chaincfg/chainhash"
 	"github.com/gcash/bchd/txscript"
 	"github.com/gcash/bchd/wire"
 	"github.com/gcash/bchutil"
+	"github.com/simpleledgerinc/GoSlp/v1parser"
 )
 
 // UtxoViewpoint represents a view into the set of unspent transaction outputs
@@ -21,8 +25,9 @@ import (
 // The unspent outputs are needed by other transactions for things such as
 // script validation and double spend prevention.
 type UtxoViewpoint struct {
-	entries  map[wire.OutPoint]*UtxoEntry
-	bestHash chainhash.Hash
+	entries       map[wire.OutPoint]*UtxoEntry
+	slpOpreturnDb map[chainhash.Hash]*[]byte
+	bestHash      chainhash.Hash
 }
 
 // LookupEntry returns information about a given transaction output according to
@@ -42,6 +47,16 @@ func (view *UtxoViewpoint) getEntry(outpoint wire.OutPoint) (*UtxoEntry, error) 
 // addEntry adds a new entry to the view.  Set overwrite to true if this
 // entry should overwrite any existing entry for the same outpoint.
 func (view *UtxoViewpoint) addEntry(outpoint wire.OutPoint, entry *UtxoEntry, overwrite bool) error {
+
+	// add SLP op_return
+	slpMsgEntry := view.slpOpreturnDb[outpoint.Hash]
+	if slpMsgEntry == nil && outpoint.Index == 0 {
+		slpMsg, _ := v1parser.ParseSLP(entry.pkScript)
+		if slpMsg != nil {
+			view.slpOpreturnDb[outpoint.Hash] = &entry.pkScript
+		}
+	}
+
 	view.entries[outpoint] = entry
 	return nil
 }
@@ -57,6 +72,18 @@ func (view *UtxoViewpoint) spendEntry(outpoint wire.OutPoint, putIfNil *UtxoEntr
 	// Then mark it as spent.
 	entry.Spend()
 	return nil
+}
+
+func (view *UtxoViewpoint) getSlpOpReturn(txHash *chainhash.Hash) (*v1parser.ParseResult, error) {
+	pkScript := view.slpOpreturnDb[*txHash]
+	if pkScript == nil {
+		return nil, errors.New("No SLP OP_RETURN has been stored for this transaction")
+	}
+	slpMsg, err := v1parser.ParseSLP(*pkScript)
+	if err != nil {
+		return nil, err
+	}
+	return slpMsg, nil
 }
 
 // addTxOut adds the specified output to the view if it is not provably
@@ -170,10 +197,121 @@ func (view *UtxoViewpoint) addInputUtxos(source utxoView, block *bchutil.Block, 
 	return nil
 }
 
+func annotateUtxoEntrySlpFlags(entry *UtxoEntry, txOutIdx int, slpMsg *v1parser.ParseResult) {
+
+	// set version flag
+	if !(slpMsg.TokenType == 0x01 ||
+		slpMsg.TokenType == 0x41 ||
+		slpMsg.TokenType == 0x81) {
+		entry.packedFlags |= tfSlpUnknownVersionTxo
+		return
+	}
+
+	// set flag for type of info, and value for slp info bytes
+	if slpMsg.TransactionType == "SEND" {
+		entry.packedFlags |= tfSlpType1AmountTxo
+	} else if slpMsg.TransactionType == "GENESIS" {
+		if txOutIdx == 1 {
+			entry.packedFlags |= tfSlpType1AmountTxo
+		} else if txOutIdx == slpMsg.Data.(v1parser.SlpGenesis).MintBatonVout {
+			entry.packedFlags |= tfSlpType1MintBatonTxo
+		}
+	} else if slpMsg.TransactionType == "MINT" && slpMsg.TokenType != 0x81 {
+		if txOutIdx == 1 {
+			entry.packedFlags |= tfSlpType1AmountTxo
+		} else if txOutIdx == slpMsg.Data.(v1parser.SlpMint).MintBatonVout {
+			entry.packedFlags |= tfSlpType1MintBatonTxo
+		}
+	}
+}
+
+func validateSlpTx(view utxoView, tx *bchutil.Tx) (*v1parser.ParseResult, error) {
+	slpMsg, err := v1parser.ParseSLP(tx.MsgTx().TxOut[0].PkScript)
+	if err != nil {
+		return nil, err
+	}
+
+	if !(slpMsg.TokenType == 0x01 ||
+		slpMsg.TokenType == 0x41 ||
+		slpMsg.TokenType == 0x81) {
+		return nil, errors.New("slp version type is not supported")
+	}
+
+	if (slpMsg.TokenType == 0x01 || slpMsg.TokenType == 0x81) && slpMsg.TransactionType == "GENESIS" {
+		return slpMsg, nil
+	}
+
+	if slpMsg.TokenType == 0x41 && slpMsg.TransactionType == "GENESIS" {
+		// TODO validate for vin 0
+		return nil, errors.New("NFT1 child validation is not yet supported")
+	}
+
+	if slpMsg.TransactionType == "MINT" {
+		for _, txIn := range tx.MsgTx().TxIn {
+			prevOut := wire.OutPoint{
+				Hash:  txIn.PreviousOutPoint.Hash,
+				Index: txIn.PreviousOutPoint.Index,
+			}
+			entry, err := view.getEntry(prevOut)
+			if err != nil {
+				panic(err)
+			}
+			if err == nil && entry == nil {
+				panic("Missing utxo entry")
+			}
+			if entry.IsSlpType1MintBatonTxo() {
+
+				// TODO #1: check the input's token ID is the same
+
+				// TODO # 2: return if so
+
+				//slpTokenView := slpTokenTxidIndex.getTokenView(slpMsg.Data.(v1parser.SlpMint).TokenID)
+				// if slpTokenView.has(prevOut.Hash) {
+				// 	return slpMsg, nil
+				// }
+
+			}
+		}
+		return nil, errors.New("invalid slp, missing mint baton input")
+	} else if slpMsg.TransactionType == "SEND" {
+		var totalInputValue big.Int
+		for _, txIn := range tx.MsgTx().TxIn {
+			prevOut := wire.OutPoint{
+				Hash:  txIn.PreviousOutPoint.Hash,
+				Index: txIn.PreviousOutPoint.Index,
+			}
+			entry, err := view.getEntry(prevOut)
+			if err != nil {
+				panic("this should never happen")
+			}
+			if entry.IsSlpType1AmountTxo() {
+				// TODO #1: check the input's token ID is the same
+
+				// TODO # 2: add the slpInfo value
+			}
+		}
+
+		totalOutputValue, err := slpMsg.TotalSlpMsgOutputValue()
+		if err == nil {
+			if totalInputValue.Cmp(totalOutputValue) != 1 {
+				return nil, errors.New("invalid slp, insufficient input amount")
+			}
+		}
+	}
+
+	panic("unhandled exception during slp token validation")
+}
+
 func addTxOuts(view utxoView, tx *bchutil.Tx, blockHeight int32, overwrite bool) error {
 	// Add the transaction's outputs as available utxos.
 	isCoinBase := IsCoinBase(tx)
 	prevOut := wire.OutPoint{Hash: *tx.Hash()}
+
+	// parse slp transaction and check input validity
+	slpMsg, _ := validateSlpTx(view, tx)
+
+	// update the txid => "SLP OP_RETURN" db with new value
+
 	for txOutIdx, txOut := range tx.MsgTx().TxOut {
 		prevOut.Index = uint32(txOutIdx)
 
@@ -200,6 +338,16 @@ func addTxOuts(view utxoView, tx *bchutil.Tx, blockHeight int32, overwrite bool)
 			// recovery mode), this entry is fresh, meaning it can be pruned when
 			// it gets spent before the next flush.
 			entry.packedFlags |= tfFresh
+		}
+
+		// slp info
+		if slpMsg != nil {
+			// annotate utxo with slp flags and info
+			annotateUtxoEntrySlpFlags(entry, txOutIdx, slpMsg)
+
+			// add this txid to the SLP TokenID => txid index
+			// TODO
+
 		}
 
 		// Add entry to the view.
@@ -239,6 +387,7 @@ func spendTransactionInputs(view utxoView, tx *bchutil.Tx, stxos *[]SpentTxOut) 
 				PkScript:   pkScript,
 				Height:     entry.BlockHeight(),
 				IsCoinBase: entry.IsCoinBase(),
+				IsSlp:      entry.IsSlp(),
 			}
 			*stxos = append(*stxos, stxo)
 		}
@@ -347,6 +496,11 @@ func disconnectTransactions(view utxoView, block *bchutil.Block, stxos []SpentTx
 			if stxo.IsCoinBase {
 				entry.packedFlags |= tfCoinBase
 			}
+			if stxo.IsSlp {
+				slpMsg, _ := v1parser.ParseSLP(tx.MsgTx().TxOut[0].PkScript)
+				annotateUtxoEntrySlpFlags(entry, txInIdx, slpMsg)
+			}
+
 			// Then store the entry in the view.
 			if err := view.addEntry(originOut, entry, true); err != nil {
 				return err
@@ -393,6 +547,10 @@ func disconnectTransactions(view utxoView, block *bchutil.Block, stxos []SpentTx
 				pkScript:    pkScript,
 				blockHeight: block.Height(),
 				packedFlags: packedFlags,
+			}
+			if entry.IsSlp() {
+				slpMsg, _ := v1parser.ParseSLP(tx.MsgTx().TxOut[0].PkScript)
+				annotateUtxoEntrySlpFlags(entry, txOutIdx, slpMsg)
 			}
 			if err := view.spendEntry(prevOut, entry); err != nil {
 				return err

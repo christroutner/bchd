@@ -6,14 +6,16 @@ package blockchain
 
 import (
 	"container/list"
+	"errors"
 	"fmt"
-	"github.com/gcash/bchd/txscript"
 	"sync"
 
 	"github.com/gcash/bchd/chaincfg/chainhash"
 	"github.com/gcash/bchd/database"
+	"github.com/gcash/bchd/txscript"
 	"github.com/gcash/bchd/wire"
 	"github.com/gcash/bchutil"
+	"github.com/simpleledgerinc/GoSlp/v1parser"
 )
 
 const (
@@ -54,6 +56,15 @@ const (
 	// know we do not need to commit them.  It is always safe to not mark
 	// tfFresh if that condition is not guaranteed.
 	tfFresh
+
+	// tfSlpVersionUnsupported indicates the txo is possibly valid but unsupported by bchd
+	tfSlpUnknownVersionTxo
+
+	// tfSlpType1Output indicates the txo has an output amount for either type1, or nft1 group or child
+	tfSlpType1AmountTxo
+
+	// tfSlpMintBaton indicates the txo is a minting baton for either type1 or NFT1 Group
+	tfSlpType1MintBatonTxo
 )
 
 // UtxoEntry houses details about an individual transaction output in a utxo
@@ -118,6 +129,42 @@ func (entry *UtxoEntry) PkScript() []byte {
 	return entry.pkScript
 }
 
+// IsSlp returns a boolean value indicating whether or not the UTXO is an SLP token
+func (entry *UtxoEntry) IsSlp() bool {
+	// TODO: check no overlap in SLP flags
+
+	if entry.IsSlpUnknownVersionTxo() ||
+		entry.IsSlpType1AmountTxo() ||
+		entry.IsSlpType1MintBatonTxo() {
+		return true
+	}
+	return false
+}
+
+// IsSlpUnknownVersionTxo
+func (entry *UtxoEntry) IsSlpUnknownVersionTxo() bool {
+	if entry.packedFlags&tfSlpUnknownVersionTxo == tfSlpUnknownVersionTxo {
+		return true
+	}
+	return false
+}
+
+// IsSlpType1AmountTxo
+func (entry *UtxoEntry) IsSlpType1AmountTxo() bool {
+	if entry.packedFlags&tfSlpType1AmountTxo == tfSlpType1AmountTxo {
+		return true
+	}
+	return false
+}
+
+// IsSlpType1MintBatonTxo
+func (entry *UtxoEntry) IsSlpType1MintBatonTxo() bool {
+	if entry.packedFlags&tfSlpType1MintBatonTxo == tfSlpType1MintBatonTxo {
+		return true
+	}
+	return false
+}
+
 // memoryUsage returns the memory usage in bytes of the UTXO entry.
 // It returns 0 for the nil element.
 func (entry *UtxoEntry) memoryUsage() uint64 {
@@ -170,6 +217,9 @@ type utxoView interface {
 
 	// spendEntry marks an entry as spent.
 	spendEntry(outpoint wire.OutPoint, entry *UtxoEntry) error
+
+	// getSlpOpReturn returns the associated SLP OP_RETURN message for the transaction
+	getSlpOpReturn(txHash *chainhash.Hash) (*v1parser.ParseResult, error)
 }
 
 // utxoCache is a cached utxo view in the chainstate of a BlockChain.
@@ -198,6 +248,9 @@ type utxoCache struct {
 
 	// flushInProgress reports whether the cache is currently being flushed
 	flushInProgress bool
+
+	// slp op_return db
+	slpOpreturnDb map[chainhash.Hash]*[]byte
 }
 
 // newUtxoCache initiates a new utxo cache instance with its memory usage limited
@@ -208,6 +261,8 @@ func newUtxoCache(db database.DB, maxTotalMemoryUsage uint64) *utxoCache {
 		maxTotalMemoryUsage: maxTotalMemoryUsage,
 
 		cachedEntries: make(map[wire.OutPoint]*UtxoEntry),
+
+		slpOpreturnDb: make(map[chainhash.Hash]*[]byte),
 	}
 }
 
@@ -221,6 +276,8 @@ func (s *utxoCache) totalMemoryUsage() uint64 {
 
 	// Total memory is all the keys plus the total memory of all the entries.
 	nbEntries := uint64(len(s.cachedEntries))
+
+	// TODO: Add SLP OP_RETURN memory usage
 
 	// Total size is total size of the keys + total size of the pointers in the
 	// map + total size of the elements held in the pointers.
@@ -346,6 +403,22 @@ func (s *utxoCache) spendEntry(outpoint wire.OutPoint, addIfNil *UtxoEntry) erro
 	return nil
 }
 
+func (s *utxoCache) getSlpOpReturn(txHash *chainhash.Hash) (*v1parser.ParseResult, error) {
+	pkScript := s.slpOpreturnDb[*txHash]
+	if pkScript == nil {
+		return nil, errors.New("No SLP OP_RETURN has been stored for this transaction")
+	}
+	slpMsg, err := v1parser.ParseSLP(*pkScript)
+	if err != nil {
+		return nil, err
+	}
+	return slpMsg, nil
+}
+
+func (s *utxoCache) GetSlpOpReturn(txHash *chainhash.Hash) (*v1parser.ParseResult, error) {
+	return s.getSlpOpReturn(txHash)
+}
+
 // AddEntry adds a new unspent entry if it is not probably unspendable.  Set
 // overwrite to true to skip validity and freshness checks and simply add the
 // item, possibly overwriting another entry that is not-fully-spent.
@@ -366,6 +439,14 @@ func (s *utxoCache) AddEntry(outpoint wire.OutPoint, entry *UtxoEntry, overwrite
 func (s *utxoCache) addEntry(outpoint wire.OutPoint, entry *UtxoEntry, overwrite bool) error {
 	// Don't add provably unspendable outputs.
 	if txscript.IsUnspendable(entry.pkScript) {
+		// update SLP op_return cache
+		slpMsgEntry := s.slpOpreturnDb[outpoint.Hash]
+		if slpMsgEntry == nil && outpoint.Index == 0 {
+			slpMsg, _ := v1parser.ParseSLP(entry.pkScript)
+			if slpMsg != nil {
+				s.slpOpreturnDb[outpoint.Hash] = &entry.pkScript
+			}
+		}
 		return nil
 	}
 
