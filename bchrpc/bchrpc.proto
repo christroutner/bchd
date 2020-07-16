@@ -261,15 +261,18 @@ message GetRawAddressTransactionsResponse {
 message GetAddressUnspentOutputsRequest {
     string address = 1;
     bool include_mempool = 2;
+    bool include_token_metadata = 3;
 }
 message GetAddressUnspentOutputsResponse {
     repeated UnspentOutput outputs = 1;
+    repeated TokenMetadata token_metadata = 2;
 }
 
 message GetUnspentOutputRequest {
     bytes hash = 1;
     uint32 index = 2;
     bool include_mempool = 3;
+    bool include_token_metadata = 4;
 }
 message GetUnspentOutputResponse {
     Transaction.Input.Outpoint outpoint = 1;
@@ -278,6 +281,9 @@ message GetUnspentOutputResponse {
 
     bool is_coinbase = 4;
     int32 block_height = 5;
+
+    SlpToken slp_token = 6;
+    TokenMetadata token_metadata = 7;
 }
 
 message GetMerkleProofRequest {
@@ -291,6 +297,7 @@ message GetMerkleProofResponse {
 
 message SubmitTransactionRequest {
     bytes transaction = 1;
+    repeated Transaction.Input.Outpoint allowed_slp_burns = 2;
 }
 message SubmitTransactionResponse {
     bytes hash = 1;
@@ -484,6 +491,8 @@ message UnspentOutput {
 
     bool is_coinbase = 4;
     int32 block_height = 5;
+
+    SlpToken slp_token = 6;
 }
 
 message TransactionFilter {
@@ -510,7 +519,8 @@ message TransactionFilter {
 message SlpToken {
     bytes token_id = 1;
     uint64 amount = 2;
-    string address = 3;
+    bool is_mint_baton = 3;
+    string address = 4;
 }
 
 message SlpTransactionInfo {
