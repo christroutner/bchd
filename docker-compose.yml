@@ -1,0 +1,9 @@
+bchd-main:
+  build: .
+  dockerfile: Dockerfile
+  container_name: bchd-main
+  ports:
+    - "8333:8333"
+  volumes:
+    - ../bchd-data:/data
+  restart: always
