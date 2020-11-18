@@ -25,7 +25,7 @@ VOLUME ["/data"]
 # Set the start command. This starts bchd with
 # flags to save the blockchain data and the
 # config on a docker volume.
-ENTRYPOINT ["bchd", "--addrindex", "--txindex", "--slpindex" "-b", "/data", "-C", "/data/bchd.conf"]
+ENTRYPOINT ["bchd", "--addrindex", "--txindex", "--slpindex", "-b", "/data", "-C", "/data/bchd.conf"]
 
 # Document that the service listens on port 8333.
 EXPOSE 8333
